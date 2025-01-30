@@ -1,4 +1,4 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
+#from transformers import AutoModelForCausalLM, AutoTokenizer
 from time import time
 import json
 import zmq
@@ -7,11 +7,15 @@ import logging
 
 responder, requester = None, None
 
+#zmq_addr = 'inproc:///tmp/assistant_zmq/0'
+zmq_addr = 'ipc:///tmp/assistant_zmq/0'
+#zmq_addr = 'inproc://assistant_zmq_0'
+
 def server_load():
     context = zmq.Context()
     responder = context.socket(zmq.REP)
     #responder.bind("tcp://*:5555")
-    responder.bind("ipc:///tmp/assistant_zmq/0")
+    responder.bind(zmq_addr)
     return responder
 
 def load_model():
@@ -43,7 +47,7 @@ def server():
                     )
         model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
-        generated_ids = model.generate(**model_inputs, max_new_tokens=512)
+        generated_ids = model.generate(**model_inputs, max_new_tokens=32768)
         generated_ids = [
                     output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
                     ]
@@ -56,7 +60,7 @@ def client_load():
     context = zmq.Context()
     requester = context.socket(zmq.REQ)
     #requester.connect("tcp://localhost:5555")
-    requester.connect("ipc:///tmp/assistant_zmq/0")
+    requester.connect(zmq_addr)
     return requester
 
 def send_request(request):
@@ -103,19 +107,23 @@ state = {'model':None, 'tokenizer':None, 'context':[], 'action':'initializing'}
 def action_upd(action, next_action):
     ''' functional state machine, to verify repl-state '''
     if action == 'initializing' and next_action == 'waiting':
-        return 'waiting'
+        return next_action
     elif action == 'waiting' and next_action == 'waiting':
-        return 'waiting'
+        return next_action
+    elif action == 'inferring' and next_action == 'waiting':
+        return next_action
     elif action == 'waiting' and next_action == 'inferring':
-        return 'inferring'
+        return next_action
     elif action == 'inferring' and next_action == 'feedback':
-        return 'feedback'
+        return next_action
+    elif action == 'inferring' and next_action == 'initializing':
+        return next_action
     elif action == 'feedback' and next_action == 'waiting':
-        return 'waiting'
+        return next_action
     elif action == 'quitting':
         raise RuntimeError(state)
     elif next_action == 'quitting':
-        return 'quitting'
+        return next_action
     else:
         raise RuntimeError(state)
 
@@ -145,28 +153,24 @@ def infer(model, tokenizer, context, prompt):
     ctx_without_rew = efilter(lambda x: x['role'] != 'user_reward', context)
     messages = filter_times(context + [prompt_msg])
     max_new_tokens = 512
-    #---
-    rpc = True
-    if rpc:
-        response = send_request({'messages':messages, 'max_new_tokens':max_new_tokens})
-    else:
-        text = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                    )
-        model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-
-        generated_ids = model.generate(**model_inputs, max_new_tokens=512)
-        generated_ids = [
-                    output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-                    ]
-
-        response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    #---
+    response = send_request({'messages':messages, 'max_new_tokens':max_new_tokens})
     response_msg =  {"role": "assistant", "content":str(response), 'time':time()}
     state['context'] = context + [prompt_msg, response_msg]
     return state, response
+
+def clear_(state):
+    state['context'] = []
+    resp = 'cleared'
+    return state, resp
+
+
+def save_(state):
+    with open('qwen_db.jsonl','a') as f:
+        s = state.copy()
+        s.pop('model')
+        s.pop('tokenizer')
+        j = json.dumps(s)
+        f.write(j + '\n')
 
 
 def infer_control(state, prompt):
@@ -175,9 +179,14 @@ def infer_control(state, prompt):
         prompt_ = edit_with_neovim('')
         state, resp = infer(state['model'], state['tokenizer'], state['context'], prompt_)
     elif p == 'quit':
+        save_(state)
         resp = 'quit'
     elif p == 'trace':
         resp = str(state)
+    elif p == 'clear':
+        state = clear_msg(state)
+        save_(state)
+        state, resp = clear_(state)
     else:
         state, resp = infer(state['model'], state['tokenizer'], state['context'], prompt)
     return state, resp
@@ -188,6 +197,11 @@ def infer_comb(state, prompt):
 def update_rew(state, reward):
     reward_msg = {"role": "user_reward", "content": reward, 'time':time()}
     state['context'] = state['context'] + [reward_msg]
+    return state
+
+def clear_msg(state):
+    clear_msg_v = {"role": "user_clear", "content": [], 'time':time()}
+    state['context'] = state['context'] + [clear_msg_v]
     return state
 
 def multiline_input(p):
@@ -201,37 +215,42 @@ def multiline_input(p):
     return '\n'.join(contents)
 
 
-def repl(state):
-    while 1:
-        try:
-            state = state_action_upd(state, 'waiting')
-            p = multiline_input('> ')
-            state = state_action_upd(state, 'inferring')
-            state, resp = infer_control(state, p)
-            print(resp)
-            if resp == 'quit':
-                state = state_action_upd(state, 'quitting')
-                break
-            state = state_action_upd(state, 'feedback')
-            try:
-                rew = input('< ')
-            except KeyboardInterrupt:
-                rew = ''
-            state = update_rew(state, rew)
-        except KeyboardInterrupt:
-            state = state_action_upd(state, 'waiting')
-            pass
 
+
+def repl(state):
+    try:
+        while 1:
+            try:
+                state = state_action_upd(state, 'waiting')
+                p = multiline_input('> ')
+                state = state_action_upd(state, 'inferring')
+                state, resp = infer_control(state, p)
+                print(resp)
+                if resp == 'quit':
+                    state = state_action_upd(state, 'quitting')
+                    break
+                elif resp == 'cleared':
+                    state = state_action_upd(state, 'waiting')
+                    continue
+                state = state_action_upd(state, 'feedback')
+                try:
+                    rew = input('< ')
+                except KeyboardInterrupt:
+                    rew = ''
+                except EOFError:
+                    rew = ''
+                state = update_rew(state, rew)
+            except KeyboardInterrupt:
+                state = state_action_upd(state, 'waiting')
+                pass
+    except:
+        save_(state)
     return state
 
 
+
+
 if __name__ == '__main__':
-    '''
-    model, tokenizer = load_model()
-    state['model'] = model
-    state['tokenizer'] = tokenizer
-    repl(state)
-    '''
     parser = argparse.ArgumentParser(description='inference api')
     subparsers = parser.add_subparsers(dest='mode', required=True)
     server_parser = subparsers.add_parser('server', help='run server')
@@ -241,11 +260,17 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.mode == "server":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         print('starting server')
         server()
     elif args.mode == "prompt":
         print('starting client')
-        reply = send_request({'text':str(args.prompt_text), 'max_new_tokens':2048})
-        print(f'ai: {reply}')
+        #reply = send_request({'text':str(args.prompt_text), 'max_new_tokens':2048, 'messages':[]})
+        model_name = "Qwen/Qwen2.5-Coder-32B-Instruct"
+        model = None
+        #tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = None
+        _, reply = infer(model, tokenizer, [], str(args.prompt_text))
+        print(f'{reply}')
     elif args.mode == "repl":
         repl(state)
