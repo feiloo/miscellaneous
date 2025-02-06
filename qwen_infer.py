@@ -1,15 +1,19 @@
-#from transformers import AutoModelForCausalLM, AutoTokenizer
 from time import time
 import json
 import zmq
 import argparse
 import logging
 
+import subprocess
+import tempfile
+import os
+
 responder, requester = None, None
 
 #zmq_addr = 'inproc:///tmp/assistant_zmq/0'
 zmq_addr = 'ipc:///tmp/assistant_zmq/0'
 #zmq_addr = 'inproc://assistant_zmq_0'
+#zmq_addr = "tcp://localhost:5555"
 
 def server_load():
     context = zmq.Context()
@@ -28,14 +32,17 @@ def load_model():
                 device_map="auto"
                 )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    return model, tokenizer
+    # Initialize the DynamicCache
+    past_key_values = DynamicCache()
+    max_cache_length = past_key_values.get_max_length()
+    return model, tokenizer, past_key_values, max_cache_length
 
 
 def server():
     global responder
     if responder is None:
         responder = server_load()
-    model, tokenizer = load_model()
+    model, tokenizer, past_key_values, max_cache_length = load_model()
 
     while 1:
         request = json.loads(responder.recv_string())
@@ -47,7 +54,10 @@ def server():
                     )
         model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
-        generated_ids = model.generate(**model_inputs, max_new_tokens=32768)
+        if isinstance(past_key_values, SinkCache):
+            inputs = {k: v[:, -max_cache_length:] for k, v in model_inputs.items()}
+
+        generated_ids = model.generate(**model_inputs, max_new_tokens=32768, do_sample=False, past_key_values=past_key_values)
         generated_ids = [
                     output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
                     ]
@@ -59,7 +69,6 @@ def server():
 def client_load():
     context = zmq.Context()
     requester = context.socket(zmq.REQ)
-    #requester.connect("tcp://localhost:5555")
     requester.connect(zmq_addr)
     return requester
 
@@ -73,9 +82,6 @@ def send_request(request):
 
 
 # qwen
-import subprocess
-import tempfile
-import os
 
 def edit_with_neovim(initial_content: str) -> str:
     # Create a temporary file
@@ -260,7 +266,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.mode == "server":
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        # import hf here, since its slow to import and only used by the server
+        from transformers import AutoModelForCausalLM, AutoTokenizer, SinkCache, DynamicCache
         print('starting server')
         server()
     elif args.mode == "prompt":
