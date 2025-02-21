@@ -3,10 +3,13 @@ import json
 import zmq
 import argparse
 import logging
+from pdb import set_trace
 
 import subprocess
 import tempfile
 import os
+from collections import defaultdict
+import torch
 
 responder, requester = None, None
 
@@ -14,6 +17,20 @@ responder, requester = None, None
 zmq_addr = 'ipc:///tmp/assistant_zmq/0'
 #zmq_addr = 'inproc://assistant_zmq_0'
 #zmq_addr = "tcp://localhost:5555"
+
+
+def efilter(*args, **kwargs):
+    return list(filter(*args, **kwargs))
+
+def dpop(k, dic):
+    dic.pop(k, None)
+    return dic
+
+def filter_times(context):
+    return [dpop('time', d) for d in context]
+
+def filter_rewards(msgs):
+    return efilter(lambda m: m['role'] != 'user_reward', msgs)
 
 def server_load():
     context = zmq.Context()
@@ -28,25 +45,36 @@ def load_model():
 
     model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype="auto",
+                #torch_dtype="auto",
+                torch_dtype=torch.bfloat16,
                 device_map="auto"
                 )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     # Initialize the DynamicCache
-    past_key_values = DynamicCache()
-    max_cache_length = past_key_values.get_max_length()
-    return model, tokenizer, past_key_values, max_cache_length
+    #past_key_values = DynamicCache()
+    #max_cache_length = past_key_values.get_max_length()
+    return model, tokenizer
 
 
 def server():
     global responder
     if responder is None:
         responder = server_load()
-    model, tokenizer, past_key_values, max_cache_length = load_model()
+    model, tokenizer = load_model()
+
+    #cache = defaultdict(lambda: DynamicCache())
+    last_msgs = None
+    cache = StaticCache(model.config, max_batch_size=1, device='cuda',dtype=torch.bfloat16)
 
     while 1:
         request = json.loads(responder.recv_string())
         messages, max_new_tokens = request['messages'], request['max_new_tokens']
+
+        if last_msgs is None or filter_rewards(filter_times(last_msgs)) != filter_rewards(filter_times(messages))[:-1]:
+            cache = StaticCache(model.config, max_batch_size=1, device='cuda',dtype=torch.bfloat16)
+
+        #past_key_values = cache[json.dumps(messages[:-1])]
+
         text = tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
@@ -54,8 +82,7 @@ def server():
                     )
         model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
-        if isinstance(past_key_values, SinkCache):
-            inputs = {k: v[:, -max_cache_length:] for k, v in model_inputs.items()}
+        past_key_values = cache
 
         generated_ids = model.generate(**model_inputs, max_new_tokens=32768, do_sample=False, past_key_values=past_key_values)
         generated_ids = [
@@ -63,6 +90,8 @@ def server():
                     ]
 
         response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        response_msg =  {"role": "assistant", "content":str(response), 'time':time()}
+        last_msgs = messages + [response_msg]
         responder.send_string(json.dumps(response))
 
 
@@ -139,21 +168,11 @@ def state_action_upd(state, n_act):
     return state
 
 
-def efilter(*args, **kwargs):
-    return list(filter(*args, **kwargs))
-
-def dpop(k, dic):
-    dic.pop(k, None)
-    return dic
-
-def filter_times(context):
-    return [dpop('time', d) for d in context]
-
 
 
 def infer(model, tokenizer, context, prompt):
     if context == []:
-        context = [{"role": "system", "content": "You are Qwen, a helpful assistant."}]
+        context = [{"role": "system", "content": "You are Qwen, a helpful assistant. Answer concisely unless asked for long form."}]
 
     prompt_msg = {"role": "user", "content": prompt, 'time':time()}
     ctx_without_rew = efilter(lambda x: x['role'] != 'user_reward', context)
@@ -232,7 +251,7 @@ def repl(state):
                 state = state_action_upd(state, 'inferring')
                 state, resp = infer_control(state, p)
                 print(resp)
-                if resp == 'quit':
+                if resp.strip() == 'quit':
                     state = state_action_upd(state, 'quitting')
                     break
                 elif resp == 'cleared':
@@ -240,7 +259,7 @@ def repl(state):
                     continue
                 state = state_action_upd(state, 'feedback')
                 try:
-                    rew = input('< ')
+                    rew = multiline_input('< ')
                 except KeyboardInterrupt:
                     rew = ''
                 except EOFError:
@@ -267,7 +286,7 @@ if __name__ == '__main__':
 
     if args.mode == "server":
         # import hf here, since its slow to import and only used by the server
-        from transformers import AutoModelForCausalLM, AutoTokenizer, SinkCache, DynamicCache
+        from transformers import AutoModelForCausalLM, AutoTokenizer, SinkCache, DynamicCache, StaticCache
         print('starting server')
         server()
     elif args.mode == "prompt":
