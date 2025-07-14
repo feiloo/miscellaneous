@@ -20,4 +20,6 @@ cd openhands...
 export SANDBOX_RUNTIME_CONTAINER_IMAGE=ghcr.io/all-hands-ai/runtime:0.48-nikolaik
 INSTALL_PLAYWRIGHT=0 RUNTIME=docker make build RUNTIME=docker
 
+use llamacpp host as: `http:127.0.0.1:8080/v1`
+
 DEBUG=1 make run FRONTEND_PORT=3000 FRONTEND_HOST=0.0.0.0 BACKEND_HOST=0.0.0.0
